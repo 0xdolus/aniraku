@@ -1,0 +1,80 @@
+name: Android Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Universal APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: Aniraku-PoC/Aniraku-App
+
+    env:
+      EXPO_PUBLIC_SUPABASE_URL: ${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}
+      EXPO_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}
+      EXPO_PUBLIC_ANILIST_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_ANILIST_CLIENT_ID }}
+      EXPO_PUBLIC_ANILIST_GRAPHQL_URL: ${{ secrets.EXPO_PUBLIC_ANILIST_GRAPHQL_URL }}
+      EXPO_PUBLIC_API_BASE_URL: ${{ secrets.EXPO_PUBLIC_API_BASE_URL }}
+      EXPO_PUBLIC_MAL_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_MAL_CLIENT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: Aniraku-PoC/Aniraku-App/pnpm-lock.yaml
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm check
+
+      - name: Tests
+        run: pnpm test
+
+      - name: Expo prebuild
+        run: npx expo prebuild --platform android --clean
+
+      - name: Build universal APK
+        working-directory: Aniraku-PoC/Aniraku-App/android
+        run: |
+          ./gradlew assembleRelease \
+            -PreactNativeArchitectures=armeabi-v7a,arm64-v8a,x86_64 \
+            -PnewArchEnabled=false \
+            --no-daemon
+
+      - name: Locate APK
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          cp "$APK" aniraku-universal.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aniraku-universal-apk
+          path: Aniraku-PoC/Aniraku-App/aniraku-universal.apk
