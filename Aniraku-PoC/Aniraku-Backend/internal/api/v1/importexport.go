@@ -36,12 +36,12 @@ import (
 // stays well inside provider rate limits and the platform's timeout.
 
 const (
-	importExportCap     = 150  // max titles per request
-	importBatchSize     = 200  // supabase rows per POST
-	importWatchBatch    = 200  // watch_history rows per POST
-	importMaxWatchRows  = 2000 // max synthesized watch rows per import
-	exportWriteCap      = 60   // max provider writes per export (bounds request time)
-	fullEpisodeSeconds  = 1440 // synthetic progress/duration for imported eps (24 min)
+	importExportCap    = 150  // max titles per request
+	importBatchSize    = 200  // supabase rows per POST
+	importWatchBatch   = 200  // watch_history rows per POST
+	importMaxWatchRows = 2000 // max synthesized watch rows per import
+	exportWriteCap     = 60   // max provider writes per export (bounds request time)
+	fullEpisodeSeconds = 1440 // synthetic progress/duration for imported eps (24 min)
 )
 
 // requireProviderToken returns the user's stored token for a provider,
@@ -224,9 +224,9 @@ func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[in
 			Data struct {
 				Page struct {
 					Media []struct {
-						ID       int `json:"id"`
+						ID       int  `json:"id"`
 						Episodes *int `json:"episodes"`
-						Title struct {
+						Title    struct {
 							Romaji  string `json:"romaji"`
 							English string `json:"english"`
 						} `json:"title"`
@@ -905,7 +905,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 	var out struct {
 		Data struct {
 			Viewer struct {
-				ID int `json:"id"`
+				ID               int `json:"id"`
 				MediaListOptions struct {
 					ScoreFormat string `json:"scoreFormat"`
 				} `json:"mediaListOptions"`
@@ -917,9 +917,9 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 						Status   string  `json:"status"`
 						Progress int     `json:"progress"`
 						Score    float64 `json:"score"`
-						Media struct {
+						Media    struct {
 							Episodes *int `json:"episodes"`
-							Title struct {
+							Title    struct {
 								Romaji  string `json:"romaji"`
 								English string `json:"english"`
 							} `json:"title"`
