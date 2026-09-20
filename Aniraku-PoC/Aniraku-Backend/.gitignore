@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+bin/
+dist/
+web/.next/
+web/out/
+
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Coverage
+coverage/
+*.cover
+
+# Misc
+.worktrees/
+.venv/
+*.tmp
+/aniraku-server
+vipertls/
+.env
+
+# Stray env variants
+.env.*
+!.env.example

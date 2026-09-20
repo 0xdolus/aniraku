@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: aniraku-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: PORT
+        value: "43211"
+      - key: ANIRAKU_SERVER_HOST
+        value: "0.0.0.0"
+      - key: ANIRAKU_SERVER_DEBUG
+        value: "false"
+      - key: ANIRAKU_SUPABASE_URL
+        sync: false
+      - key: ANIRAKU_SUPABASE_ANON_KEY
+        sync: false
+      - key: ANIRAKU_SUPABASE_SERVICE_KEY
+        sync: false
+      - key: ANIRAKU_ANILIST_CLIENT_ID
+        sync: false
+      - key: ANIRAKU_ANILIST_CLIENT_SECRET
+        sync: false
+      - key: ANIRAKU_MAL_CLIENT_ID
+        sync: false
+      - key: ANIRAKU_MAL_CLIENT_SECRET
+        sync: false
+      - key: ANIRAKU_OAUTH_REDIRECT_URL
+        sync: false
+      - key: ANIRAKU_OAUTH_STATE_SECRET
+        sync: false
+      # Rate limiting keys on the client IP. Behind Render's proxy the socket
+      # peer is that proxy, so without trusted CIDRs every visitor shares one
+      # rate-limit bucket. Render does not publish stable proxy CIDRs; set
+      # this only if you terminate TLS elsewhere (e.g. Cloudflare) with known
+      # CIDRs. Leave unset (default) to rate-limit on the proxy peer — safe
+      # but coarse. See README "Deployment notes".
+      - key: ANIRAKU_TRUSTED_PROXY_CIDRS
+        sync: false

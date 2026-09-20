@@ -1,0 +1,105 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getEpisodes, getServers } from "../lib/aniraku-api";
+
+const originalFetch = global.fetch;
+
+afterEach(() => {
+  global.fetch = originalFetch;
+});
+
+describe("Aniraku episode contract", () => {
+  it("normalizes the live backend episode object without replacing real metadata", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        episodes: [
+          { number: 10, title: "Real title", thumbnail: "https://cdn.aniraku.tech/episode.jpg", filler: true },
+          { number: 20, title: "Second title", thumbnail: "https://cdn.aniraku.tech/episode-2.jpg" },
+        ],
+      }),
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    await expect(getEpisodes(16498)).resolves.toEqual([
+      { number: 1, title: "Real title", thumbnail: "https://cdn.aniraku.tech/episode.jpg", description: undefined, isFiller: true },
+      { number: 2, title: "Second title", thumbnail: "https://cdn.aniraku.tech/episode-2.jpg", description: undefined, isFiller: false },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("https://api.aniraku.tech/api/v1/anime/16498/episodes"), expect.objectContaining({ headers: { Accept: "application/json" } }));
+  });
+
+  it("rejects a malformed Aniraku episode response instead of treating it as empty availability", async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, text: async () => JSON.stringify({ unexpected: [] }) }) as typeof fetch;
+    await expect(getEpisodes(16498)).rejects.toThrow("Aniraku returned an invalid episode availability response");
+  });
+
+  it("uses the Aniraku episode endpoint once and does not fall back to Miruro", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      text: async () => JSON.stringify({ error: "Aniraku episodes are unavailable" }),
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    await expect(getEpisodes(16498)).rejects.toThrow("Aniraku episodes are unavailable");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toContain("https://api.aniraku.tech/api/v1/anime/16498/episodes");
+  });
+
+  it("returns all servers from the backend (Momo, Niko, Ally, Pewe, etc.)", async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, text: async () => JSON.stringify([
+      { name: "ally", provider: "miruro", lang: "sub" },
+      { name: "pewe", provider: "miruro", lang: "sub" },
+      { name: "momo", provider: "momo", lang: "sub" },
+      { name: "niko", provider: "niko", lang: "sub" },
+    ]) }) as typeof fetch;
+
+    await expect(getServers(16498, 1, "sub")).resolves.toEqual([
+      { id: "ally:sub:0", provider: "miruro", label: "ALLY", lang: "sub", sources: undefined, headers: undefined, downloads: undefined, subtitles: undefined },
+      { id: "pewe:sub:1", provider: "miruro", label: "PEWE", lang: "sub", sources: undefined, headers: undefined, downloads: undefined, subtitles: undefined },
+      { id: "momo:sub:2", provider: "momo", label: "MOMO", lang: "sub", sources: undefined, headers: undefined, downloads: undefined, subtitles: undefined },
+      { id: "niko:sub:3", provider: "niko", label: "NIKO", lang: "sub", sources: undefined, headers: undefined, downloads: undefined, subtitles: undefined },
+    ]);
+  });
+
+  it("deduplicates servers by display name", async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, text: async () => JSON.stringify([
+      { name: "momo", provider: "momo", lang: "sub" },
+      { name: "momo", provider: "momo", lang: "sub" },
+    ]) }) as typeof fetch;
+
+    const result = await getServers(16498, 1, "sub");
+    expect(result).toHaveLength(1);
+    expect(result[0].provider).toBe("momo");
+  });
+
+  it("filters out flixcloud as unsupported", async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, text: async () => JSON.stringify([
+      { name: "flixcloud", provider: "flixcloud", lang: "sub" },
+      { name: "momo", provider: "momo", lang: "sub" },
+    ]) }) as typeof fetch;
+
+    const result = await getServers(16498, 1, "sub");
+    expect(result).toHaveLength(1);
+    expect(result[0].provider).toBe("momo");
+  });
+
+  it("keeps flixcloud when it is the only server the backend lists (hentai embed-only)", async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, text: async () => JSON.stringify([
+      { name: "Yuta", provider: "flixcloud", lang: "sub", sources: [{ url: "https://flixcloud.cc/e/abc", type: "embed", verification: "embed" }] },
+    ]) }) as typeof fetch;
+
+    const result = await getServers(113417, 1, "sub");
+    expect(result).toHaveLength(1);
+    expect(result[0].provider).toBe("flixcloud");
+    expect(result[0].label).toBe("YUTA");
+  });
+
+  it("returns no providers for an out-of-range episode without fabricating a stream", async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, text: async () => "null" }) as typeof fetch;
+    await expect(getServers(16498, 63, "sub")).resolves.toEqual([]);
+  });
+
+  it("propagates network errors so the caller can retry", async () => {
+    global.fetch = vi.fn().mockRejectedValue(new Error("network down")) as unknown as typeof fetch;
+    await expect(getServers(16498, 1, "sub")).rejects.toThrow();
+  });
+});

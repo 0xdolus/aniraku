@@ -1,0 +1,492 @@
+import { APP_CONFIG } from "@/lib/app-config";
+import type { AiringSchedulePage, Anime, AnimePage } from "@/lib/types";
+
+// AniList is TEMPORARILY rate-limited to 30 req/min (normal is 90). The global
+// slot serializes every query in the app, so 60s ÷ 30 = 2s minimum spacing;
+// 2.1s keeps a small safety margin. Batching (aliased pages / id_in) is what
+// keeps screens fast under this cap — not faster request firing. When AniList
+// restores 90 req/min, 900ms was the proven value.
+const CLIENT_REQUEST_INTERVAL_MS = process.env.VITEST ? 0 : 2_100;
+const REQUEST_CACHE_TTL_MS = 5 * 60_000;
+const STALE_CACHE_TTL_MS = 30 * 60_000;
+const responseCache = new Map<string, { expiresAt: number; staleUntil: number; value: unknown }>();
+const inFlightRequests = new Map<string, Promise<unknown>>();
+let nextAniListRequestAt = 0;
+let blockedUntil = 0;
+
+export class AniListRateLimitError extends Error {
+  readonly retryAfterMs: number | null;
+
+  constructor(retryAfterMs: number | null) {
+    const retrySeconds = retryAfterMs === null ? null : Math.max(1, Math.ceil(retryAfterMs / 1000));
+    super(retrySeconds ? `AniList is busy. Try again in ${retrySeconds} seconds.` : "AniList is busy. Try again in a moment.");
+    this.name = "AniListRateLimitError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export class AniListUnavailableError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status = 503) {
+    super(message);
+    this.name = "AniListUnavailableError";
+    this.status = status;
+  }
+}
+
+/**
+ * AniList rejects `page × perPage > 5000` with
+ * "Page depth exceeds maximum allowed for API requests (5000 entries)".
+ * Surfaced as its own class so callers (Random pool) can auto-recover
+ * with known-good front pages instead of retrying the same deep pages
+ * and showing the raw upstream message.
+ */
+export class AniListPageDepthError extends Error {
+  constructor() {
+    super("Our random pool went too deep. We loaded safe picks instead — try again.");
+    this.name = "AniListPageDepthError";
+  }
+}
+
+export function isAniListPageDepthError(error: unknown): error is AniListPageDepthError {
+  return error instanceof AniListPageDepthError;
+}
+
+function isPageDepthMessage(message: string): boolean {
+  return /page depth exceeds maximum|5000 entries/i.test(message);
+}
+
+export function isAniListRateLimitError(error: unknown): error is AniListRateLimitError {
+  return error instanceof AniListRateLimitError;
+}
+
+export function isAniListUnavailableError(error: unknown): error is AniListUnavailableError {
+  return error instanceof AniListUnavailableError;
+}
+
+function getRetryAfterMs(headers?: Headers): number | null {
+  const retryAfter = headers?.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+    const dateMs = Date.parse(retryAfter);
+    if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+  }
+  const rateLimitReset = Number(headers?.get("x-ratelimit-reset"));
+  if (Number.isFinite(rateLimitReset) && rateLimitReset > 0) return Math.max(0, rateLimitReset * 1000 - Date.now());
+  return null;
+}
+
+function updateAniListRateState(headers?: Headers, status?: number) {
+  const remaining = Number(headers?.get("x-ratelimit-remaining"));
+  if (Number.isFinite(remaining) && remaining <= 2) {
+    // Flat cooldown while the temporary 30 req/min limit is active.
+    nextAniListRequestAt = Math.max(nextAniListRequestAt, Date.now() + 2_500);
+  }
+  const retryAfterMs = getRetryAfterMs(headers);
+  if (retryAfterMs !== null && (remaining === 0 || status === 429)) {
+    blockedUntil = Math.max(blockedUntil, Date.now() + retryAfterMs);
+  } else if (status === 429) {
+    // 429 without a Retry-After header still cools down for a minute so
+    // we don't spin through the minute's budget retrying the same slot.
+    blockedUntil = Math.max(blockedUntil, Date.now() + 60_000);
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => globalThis.setTimeout(resolve, ms));
+}
+
+async function waitForAniListSlot() {
+  const now = Date.now();
+  const scheduledAt = Math.max(now, nextAniListRequestAt, blockedUntil);
+  nextAniListRequestAt = scheduledAt + CLIENT_REQUEST_INTERVAL_MS;
+  if (scheduledAt > now) await sleep(scheduledAt - now);
+}
+
+const fields = `
+  id type title { romaji english native } coverImage { large extraLarge color } bannerImage
+  description(asHtml: false) genres format status episodes duration averageScore popularity
+  season seasonYear isAdult idMal nextAiringEpisode { episode airingAt }
+  trailer { id site thumbnail }
+`;
+
+const detailFields = `${fields}
+  relations {
+    edges {
+      relationType
+      node { ${fields} }
+    }
+  }
+`;
+
+const pageQuery = `query MediaPage($page: Int!, $perPage: Int!, $sort: [MediaSort], $search: String, $status: MediaStatus, $season: MediaSeason, $seasonYear: Int, $genre: String, $format: MediaFormat, $isAdult: Boolean) {
+  Page(page: $page, perPage: $perPage) { pageInfo { currentPage hasNextPage total } media(type: ANIME, isAdult: $isAdult, sort: $sort, search: $search, status: $status, season: $season, seasonYear: $seasonYear, genre: $genre, format: $format) { ${fields} } }
+}`;
+
+const homeQuery = `query Home($isAdult: Boolean) {
+  trending: Page(page: 1, perPage: 12) { media(type: ANIME, isAdult: $isAdult, sort: [TRENDING_DESC, POPULARITY_DESC]) { ${fields} } }
+  popular: Page(page: 1, perPage: 12) { media(type: ANIME, isAdult: $isAdult, sort: [POPULARITY_DESC]) { ${fields} } }
+  upcoming: Page(page: 1, perPage: 12) { media(type: ANIME, isAdult: $isAdult, status: NOT_YET_RELEASED, sort: [POPULARITY_DESC]) { ${fields} } }
+}`;
+
+export type AiringScheduleWindow = { startAt: number; endAt: number };
+
+const airingScheduleQuery = `query AiringSchedule($page: Int!, $perPage: Int!, $startAt: Int, $endAt: Int) {
+  Page(page: $page, perPage: $perPage) { pageInfo { currentPage hasNextPage total } airingSchedules(notYetAired: true, airingAt_greater: $startAt, airingAt_lesser: $endAt, sort: [TIME]) { airingAt episode media { ${fields} } } }
+}`;
+
+/**
+ * Slim fragments for the discovery tabs. Descriptions, banners, and trailers
+ * are kilobytes per title — dropping them shrinks the 7-day schedule and the
+ * 150-title pool payloads by an order of magnitude, which is what makes
+ * first paint fast on mobile networks. Full detail still loads on demand via
+ * getAnimeById when a title is opened.
+ */
+const scheduleMediaFields = `
+  id type title { romaji english native } coverImage { large extraLarge } format status
+`;
+
+/**
+ * Slim shared fragment for id-batch and home-rail lookups. Details load on
+ * demand via getAnimeById when a title is opened — rails never ship kilobyte
+ * descriptions per row.
+ */
+const slimAnimeFields = `
+  id type title { romaji english native } coverImage { large extraLarge } format status episodes
+`;
+
+const poolFields = `
+  id type title { romaji english native } coverImage { large extraLarge color } format status episodes genres season seasonYear isAdult
+`;
+
+/** Start-of-today → +7 days window shared by the Schedule tab and its startup prefetch. */
+export function currentWeekWindow(): AiringScheduleWindow {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 7);
+  return { startAt: Math.floor(start.getTime() / 1000), endAt: Math.floor(end.getTime() / 1000) };
+}
+
+async function request<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
+  const providedVariables = Object.fromEntries(Object.entries(variables).filter(([, value]) => value != null));
+  const requestBody = JSON.stringify({ query, variables: providedVariables });
+  const cacheKey = requestBody;
+  const now = Date.now();
+  const cached = responseCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.value as T;
+  const staleValue = cached && cached.staleUntil > now ? cached.value as T : undefined;
+  if (cached && cached.staleUntil <= now) responseCache.delete(cacheKey);
+
+  const existingRequest = inFlightRequests.get(cacheKey);
+  if (existingRequest) return existingRequest as Promise<T>;
+
+  const requestPromise = (async () => {
+    try {
+      await waitForAniListSlot();
+      const response = await fetch(APP_CONFIG.anilistGraphqlUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: requestBody,
+      });
+      const rawPayload = await response.text();
+      let payload: { data?: T; errors?: Array<{ message?: string }> } = {};
+      try { payload = rawPayload ? JSON.parse(rawPayload) : {}; } catch { throw new Error("AniList returned an unreadable response."); }
+      updateAniListRateState(response.headers, response.status);
+      if (response.status === 429) throw new AniListRateLimitError(getRetryAfterMs(response.headers));
+      const upstreamMessage = payload.errors?.[0]?.message || `AniList is unavailable (${response.status}).`;
+      if (isPageDepthMessage(upstreamMessage)) throw new AniListPageDepthError();
+      if (response.status === 403 && /temporarily disabled|severe stability issues/i.test(upstreamMessage)) {
+        throw new AniListUnavailableError("AniList is temporarily unavailable due to an upstream stability issue. Try again shortly.", response.status);
+      }
+      if (!response.ok) throw new Error(upstreamMessage);
+      if (payload.errors?.length) {
+        if (isPageDepthMessage(payload.errors[0]?.message ?? "")) throw new AniListPageDepthError();
+        throw new Error(payload.errors[0]?.message || "AniList returned an invalid response.");
+      }
+      const data = payload.data as T;
+      responseCache.set(cacheKey, { expiresAt: Date.now() + REQUEST_CACHE_TTL_MS, staleUntil: Date.now() + STALE_CACHE_TTL_MS, value: data });
+      return data;
+    } catch (error) {
+      if (staleValue !== undefined) return staleValue;
+      throw error;
+    }
+  })();
+  inFlightRequests.set(cacheKey, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    inFlightRequests.delete(cacheKey);
+  }
+}
+
+export function resetAniListRequestStateForTests() {
+  responseCache.clear();
+  inFlightRequests.clear();
+  nextAniListRequestAt = 0;
+  blockedUntil = 0;
+}
+
+// AniList caps: at most 50 items per Page, and page × perPage ≤ 5000.
+// Clamping here prevents "Page depth exceeds maximum" for every caller,
+// present and future — not just the Random pool.
+export const ANILIST_MAX_PER_PAGE = 50;
+export const ANILIST_MAX_PAGE_DEPTH = 5000;
+
+export function clampAniListPage(page: number, perPage: number): number {
+  const safePerPage = Math.min(Math.max(1, Math.floor(perPage) || 1), ANILIST_MAX_PER_PAGE);
+  const maxPage = Math.max(1, Math.floor(ANILIST_MAX_PAGE_DEPTH / safePerPage));
+  const parsed = Math.floor(Number(page));
+  if (!Number.isFinite(parsed) || parsed < 1) return 1;
+  return Math.min(parsed, maxPage);
+}
+
+export function clampAniListPerPage(perPage: number): number {
+  const parsed = Math.floor(Number(perPage));
+  if (!Number.isFinite(parsed)) return 20;
+  return Math.min(Math.max(parsed, 1), ANILIST_MAX_PER_PAGE);
+}
+
+/**
+ * Deep-link safety: rail "View all" links and shared URLs feed raw strings
+ * into GraphQL enum slots (`sort`, `status`, `format`). One unknown value
+ * fails the WHOLE request with a 400, so every param is allowlisted —
+ * garbage falls back instead of erroring the screen.
+ */
+const VALID_MEDIA_SORTS = new Set([
+  "ID", "ID_DESC",
+  "TITLE_ROMAJI", "TITLE_ROMAJI_DESC", "TITLE_ENGLISH", "TITLE_ENGLISH_DESC",
+  "TITLE_NATIVE", "TITLE_NATIVE_DESC", "TYPE", "TYPE_DESC", "FORMAT", "FORMAT_DESC",
+  "START_DATE", "START_DATE_DESC", "END_DATE", "END_DATE_DESC",
+  "SCORE", "SCORE_DESC", "POPULARITY", "POPULARITY_DESC",
+  "TRENDING", "TRENDING_DESC", "EPISODES", "EPISODES_DESC",
+  "DURATION", "DURATION_DESC", "STATUS", "STATUS_DESC",
+  "UPDATED_AT", "UPDATED_AT_DESC", "SEARCH_MATCH", "FAVOURITES", "FAVOURITES_DESC",
+]);
+
+const VALID_MEDIA_STATUSES = new Set(["FINISHED", "RELEASING", "NOT_YET_RELEASED", "CANCELLED", "HIATUS"]);
+
+const VALID_MEDIA_FORMATS = new Set(["TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA", "MUSIC", "MANGA", "NOVEL", "ONE_SHOT"]);
+
+/** Allowlisted sort list, or null when nothing usable survives (caller falls back). Accepts the raw expo-router param shape. */
+export function sanitizeMediaSortList(value: string | readonly string[] | null | undefined): string[] | null {
+  const raw = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
+  const clean: string[] = [];
+  for (const entry of raw) {
+    const normalized = String(entry ?? "").trim().toUpperCase();
+    if (VALID_MEDIA_SORTS.has(normalized) && !clean.includes(normalized)) clean.push(normalized);
+  }
+  return clean.length ? clean : null;
+}
+
+/** Allowlisted status, or undefined when unusable (omitted from the query). */
+export function sanitizeMediaStatus(value: unknown): string | undefined {
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return VALID_MEDIA_STATUSES.has(normalized) ? normalized : undefined;
+}
+
+/** Allowlisted format, or undefined when unusable (omitted from the query). */
+export function sanitizeMediaFormat(value: unknown): string | undefined {
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return VALID_MEDIA_FORMATS.has(normalized) ? normalized : undefined;
+}
+
+export async function getAnimePage(options: {
+  page?: number;
+  perPage?: number;
+  sort?: string[];
+  search?: string;
+  status?: string;
+  season?: string;
+  seasonYear?: number;
+  genre?: string;
+  format?: string;
+  isAdult?: boolean | null;
+} = {}): Promise<AnimePage> {
+  const perPage = clampAniListPerPage(options.perPage ?? 20);
+  const page = clampAniListPage(options.page ?? 1, perPage);
+  const data = await request<{ Page: AnimePage }>(pageQuery, {
+    page,
+    perPage,
+    sort: options.sort ?? ["POPULARITY_DESC"],
+    search: options.search,
+    status: options.status,
+    season: options.season,
+    seasonYear: options.seasonYear,
+    genre: options.genre,
+    format: options.format,
+    isAdult: options.isAdult,
+  });
+  return data.Page;
+}
+
+export async function getHomeAnime(isAdult?: boolean | null) {
+  const data = await request<{ trending: AnimePage; popular: AnimePage; upcoming: AnimePage }>(homeQuery, { isAdult });
+  return { trending: data.trending.media, popular: data.popular.media, upcoming: data.upcoming.media };
+}
+
+export async function getAnimeById(id: number): Promise<Anime> {
+  const query = `query Anime($id: Int!) { Media(id: $id, type: ANIME) { ${detailFields} } }`;
+  const data = await request<{ Media: Anime }>(query, { id });
+  return data.Media;
+}
+
+/** Watch.jsx uses AniList's MAL mapping to fetch AniSkip timestamps. */
+export async function getMalIdByAnimeId(id: number) {
+  const query = `query AnimeMalId($id: Int!) { Media(id: $id, type: ANIME) { idMal } }`;
+  const data = await request<{ Media?: { idMal?: number | null } }>(query, { id });
+  const malId = Number(data.Media?.idMal);
+  return Number.isInteger(malId) && malId > 0 ? malId : null;
+}
+
+/** Prefer metadata already returned by Aniraku before using the AniList fallback lookup. */
+export function getKnownMalId(anime: Pick<Anime, "idMal" | "malId" | "mal_id" | "myAnimeListId"> | null | undefined) {
+  const value = anime?.idMal ?? anime?.malId ?? anime?.mal_id ?? anime?.myAnimeListId;
+  const malId = Number(value);
+  return Number.isInteger(malId) && malId > 0 ? malId : null;
+}
+
+/**
+ * Splits ids into chunks of `size` for aliased `media(id_in: [...])` batches.
+ * AniList caps a single Page at 50 per_page, so 50 is the natural chunk.
+ */
+export function chunkIds(ids: readonly number[], size = 50): number[][] {
+  const chunks: number[][] = [];
+  const unique: number[] = [];
+  const seen = new Set<number>();
+  for (const id of ids) {
+    const parsed = Number(id);
+    if (!Number.isInteger(parsed) || parsed <= 0 || seen.has(parsed)) continue;
+    seen.add(parsed);
+    unique.push(parsed);
+  }
+  for (let offset = 0; offset < unique.length; offset += Math.max(1, size)) {
+    chunks.push(unique.slice(offset, offset + Math.max(1, size)));
+  }
+  return chunks;
+}
+
+const animeByIdsQuery = `query AnimeByIds($ids: [Int!]!) {
+  Page(perPage: 50) { media(type: ANIME, id_in: $ids) { ${slimAnimeFields} } }
+}`;
+
+/**
+ * N bookmark metadata lookups in ONE AniList request per 50 ids. The episode
+ * alert monitor previously fired one getAnimeById per bookmark — a 30-bookmark
+ * user burned the entire temporary 30 req/min budget in one foreground.
+ */
+export async function getAnimeByIds(ids: readonly number[]): Promise<Anime[]> {
+  const chunks = chunkIds(ids);
+  if (!chunks.length) return [];
+  const pages = await Promise.all(chunks.map((chunk) =>
+    request<{ Page: AnimePage }>(animeByIdsQuery, { ids: chunk }).then((data) => data.Page.media),
+  ));
+  return pages.flat();
+}
+
+const airingScheduleBatchQuery = `query AiringScheduleBatch($perPage: Int!, $startAt: Int, $endAt: Int) {
+  first: Page(page: 1, perPage: $perPage) { pageInfo { currentPage hasNextPage total } airingSchedules(notYetAired: true, airingAt_greater: $startAt, airingAt_lesser: $endAt, sort: [TIME]) { airingAt episode media { ${scheduleMediaFields} } } }
+  second: Page(page: 2, perPage: $perPage) { pageInfo { currentPage hasNextPage total } airingSchedules(notYetAired: true, airingAt_greater: $startAt, airingAt_lesser: $endAt, sort: [TIME]) { airingAt episode media { ${scheduleMediaFields} } } }
+}`;
+
+/**
+ * The 7-day schedule in ONE AniList round trip. Two aliased pages ride the
+ * same HTTP request through the same throttle slot, so the tab pays ~1x
+ * latency instead of 2x serial waits.
+ */
+export async function getAiringScheduleWindow(window?: AiringScheduleWindow): Promise<AiringSchedulePage> {
+  const data = await request<{ first: AiringSchedulePage; second: AiringSchedulePage }>(
+    airingScheduleBatchQuery,
+    { perPage: 50, startAt: window?.startAt, endAt: window?.endAt },
+  );
+  const total = data.first.pageInfo?.total ?? data.first.airingSchedules.length;
+  const schedules = total <= 50
+    ? data.first.airingSchedules
+    : [...data.first.airingSchedules, ...data.second.airingSchedules];
+  return { ...data.first, airingSchedules: schedules };
+}
+
+const animePoolQuery = `query AnimePool($perPage: Int!, $pageA: Int!, $pageB: Int!, $pageC: Int!, $sort: [MediaSort], $genre: String, $isAdult: Boolean) {
+  a: Page(page: $pageA, perPage: $perPage) { media(type: ANIME, isAdult: $isAdult, sort: $sort, genre: $genre) { ${poolFields} } }
+  b: Page(page: $pageB, perPage: $perPage) { media(type: ANIME, isAdult: $isAdult, sort: $sort, genre: $genre) { ${poolFields} } }
+  c: Page(page: $pageC, perPage: $perPage) { media(type: ANIME, isAdult: $isAdult, sort: $sort, genre: $genre) { ${poolFields} } }
+}`;
+
+/**
+ * A 150-title surprise pool in ONE AniList round trip. Three aliased pages
+ * share one HTTP request and one throttle slot; the Random screen then deals
+ * from the pool client-side with zero network per pick.
+ */
+export async function getAnimePool(options: {
+  pages: [number, number, number];
+  perPage?: number;
+  sort?: string[];
+  genre?: string;
+  isAdult?: boolean | null;
+} = { pages: [1, 2, 3] }): Promise<Anime[]> {
+  const perPage = clampAniListPerPage(options.perPage ?? 50);
+  // Defense in depth: even if a caller passes stale deep pages (e.g. a
+  // session triple from before the depth fix), clamp them so AniList
+  // never sees page × perPage > 5000.
+  const pages: [number, number, number] = [
+    clampAniListPage(options.pages[0], perPage),
+    clampAniListPage(options.pages[1], perPage),
+    clampAniListPage(options.pages[2], perPage),
+  ];
+  const data = await request<{ a: AnimePage; b: AnimePage; c: AnimePage }>(animePoolQuery, {
+    perPage,
+    pageA: pages[0],
+    pageB: pages[1],
+    pageC: pages[2],
+    sort: options.sort ?? ["ID_DESC"],
+    genre: options.genre,
+    isAdult: options.isAdult,
+  });
+  const seen = new Set<number>();
+  const pool: Anime[] = [];
+  for (const page of [data.a, data.b, data.c]) {
+    for (const item of page?.media ?? []) {
+      if (!item || seen.has(item.id)) continue;
+      seen.add(item.id);
+      pool.push(item);
+    }
+  }
+  return pool;
+}
+
+const homeRailsQuery = `query HomeRails($isAdult: Boolean) {
+  ongoing: Page(page: 1, perPage: 12) { media(type: ANIME, isAdult: $isAdult, status: RELEASING, sort: [POPULARITY_DESC]) { ${slimAnimeFields} } }
+  topMovies: Page(page: 1, perPage: 12) { media(type: ANIME, isAdult: $isAdult, format: MOVIE, sort: [SCORE_DESC]) { ${slimAnimeFields} } }
+  justFinished: Page(page: 1, perPage: 12) { media(type: ANIME, isAdult: $isAdult, status: FINISHED, sort: [END_DATE_DESC]) { ${slimAnimeFields} } }
+}`;
+
+/**
+ * Home's three lower rails in ONE AniList round trip. Under the temporary
+ * 30 req/min cap this keeps the whole Home screen at 2 requests total:
+ * getHomeAnime (hero/trending/popular/upcoming) + this.
+ */
+export async function getHomeRailAnime(isAdult?: boolean | null): Promise<{ ongoing: Anime[]; topMovies: Anime[]; justFinished: Anime[] }> {
+  const data = await request<{ ongoing: AnimePage; topMovies: AnimePage; justFinished: AnimePage }>(homeRailsQuery, { isAdult });
+  return {
+    ongoing: data.ongoing.media,
+    topMovies: data.topMovies.media,
+    justFinished: data.justFinished.media,
+  };
+}
+
+export async function getRecommendations(animeId: number): Promise<Anime[]> {
+  const query = `query Recommendations($mediaId: Int!) {
+    MediaRecommendations(mediaId: $mediaId, sort: RATING_DESC, perPage: 12) {
+      edges {
+        node {
+          rating
+          mediaRecommendation { ${fields} }
+        }
+      }
+    }
+  }`;
+  const data = await request<{ MediaRecommendations?: { edges?: Array<{ node: { rating: number; mediaRecommendation: Anime } }> } }>(query, { mediaId: animeId });
+  return (data.MediaRecommendations?.edges ?? []).map((edge) => edge.node.mediaRecommendation);
+}
